@@ -1,0 +1,16 @@
+flipflop
+========
+
+flipflop is a FastCGI/WSGI gateway.
+
+https://github.com/Kozea/flipflop
+
+This module is a simplified fork of flup, written by Allan Saddi. It only has
+the FastCGI part of the original module.
+
+| #!/usr/bin/env python
+| from myapplication import app
+| from flipflop import WSGIServer
+| WSGIServer(app).run()
+
+flipflop is released under the BSD 2-Clause license.
