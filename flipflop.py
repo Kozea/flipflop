@@ -701,7 +701,130 @@ class Connection(object):
         self.writeRecord(outrec)
 
 
-class BaseFCGIServer(object):
+class ThreadPool(object):
+    """
+    Thread pool that maintains the number of idle threads between
+    minSpare and maxSpare inclusive. By default, there is no limit on
+    the number of threads that can be started, but this can be controlled
+    by maxThreads.
+    """
+    def __init__(self, minSpare=1, maxSpare=5, maxThreads=sys.maxsize):
+        self._minSpare = minSpare
+        self._maxSpare = maxSpare
+        self._maxThreads = max(minSpare, maxThreads)
+
+        self._lock = threading.Condition()
+        self._workQueue = []
+        self._idleCount = self._workerCount = maxSpare
+
+        self._threads = []
+        self._stop = False
+
+        # Start the minimum number of worker threads.
+        for i in range(maxSpare):
+            self._start_new_thread()
+
+    def _start_new_thread(self):
+        t = threading.Thread(target=self._worker)
+        self._threads.append(t)
+        t.setDaemon(True)
+        t.start()
+        return t
+
+    def shutdown(self):
+        """shutdown all workers."""
+        self._lock.acquire()
+        self._stop = True
+        self._lock.notifyAll()
+        self._lock.release()
+
+        # wait for all threads to finish
+        for t in self._threads[:]:
+            t.join()
+
+    def addJob(self, job, allowQueuing=True):
+        """
+        Adds a job to the work queue. The job object should have a run()
+        method. If allowQueuing is True (the default), the job will be
+        added to the work queue regardless if there are any idle threads
+        ready. (The only way for there to be no idle threads is if maxThreads
+        is some reasonable, finite limit.)
+
+        Otherwise, if allowQueuing is False, and there are no more idle
+        threads, the job will not be queued.
+
+        Returns True if the job was queued, False otherwise.
+        """
+        self._lock.acquire()
+        try:
+            # Maintain minimum number of spares.
+            while (self._idleCount < self._minSpare and
+                   self._workerCount < self._maxThreads):
+                try:
+                    self._start_new_thread()
+                except:
+                    return False
+                self._workerCount += 1
+                self._idleCount += 1
+
+            # Hand off the job.
+            if self._idleCount or allowQueuing:
+                self._workQueue.append(job)
+                self._lock.notify()
+                return True
+            else:
+                return False
+        finally:
+            self._lock.release()
+
+    def _worker(self):
+        """
+        Worker thread routine. Waits for a job, executes it, repeat.
+        """
+        self._lock.acquire()
+        try:
+            while True:
+                while not self._workQueue and not self._stop:
+                    self._lock.wait()
+
+                if self._stop:
+                    return
+
+                # We have a job to do...
+                job = self._workQueue.pop(0)
+
+                assert self._idleCount > 0
+                self._idleCount -= 1
+
+                self._lock.release()
+
+                try:
+                    job.run()
+                except:
+                    # FIXME: This should really be reported somewhere.
+                    # But we can't simply report it to stderr because of fcgi
+                    pass
+
+                self._lock.acquire()
+
+                if self._idleCount == self._maxSpare:
+                    break  # NB: lock still held
+                self._idleCount += 1
+                assert self._idleCount <= self._maxSpare
+
+            # Die off...
+            assert self._workerCount > self._maxSpare
+            self._threads.remove(threading.currentThread())
+            self._workerCount -= 1
+        finally:
+            self._lock.release()
+
+
+class WSGIServer(object):
+    """
+    FastCGI server that supports the Web Server Gateway Interface. See
+    <http://www.python.org/peps/pep-0333.html>.
+    """
     request_class = Request
 
     # The maximum number of bytes (per Record) to write to the server.
@@ -715,6 +838,11 @@ class BaseFCGIServer(object):
     inputStreamShrinkThreshold = 102400 - 8192
 
     def __init__(self, application, environ=None, roles=(FCGI_RESPONDER,)):
+        """
+        environ, if present, must be a dictionary-like object. Its
+        contents will be copied into application's environ. Useful
+        for passing application-specific variables.
+        """
         if environ is None:
             environ = {}
 
@@ -735,20 +863,53 @@ class BaseFCGIServer(object):
             FCGI_MAX_CONNS: maxConns,
             FCGI_MAX_REQS: maxReqs,
             FCGI_MPXS_CONNS: 0}
+        self._jobClass = self._connectionClass
+        self._jobArgs = (self, None)
+        self._threadPool = ThreadPool()
 
-    def _setupSocket(self):
-        sock = socket.fromfd(
-            FCGI_LISTENSOCK_FILENO, socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            sock.getpeername()
-        except socket.error as e:
-            if e.args[0] != errno.ENOTCONN:
-                raise
-        return sock
+    def _is_client_allowed(self, addr):
+        return (
+            self._web_server_addrs is None or
+            (len(addr) == 2 and addr[0] in self._web_server_addrs))
 
-    def _cleanupSocket(self, sock):
-        """Closes the main socket."""
-        sock.close()
+    def shutdown(self):
+        """Wait for running threads to finish."""
+        self._threadPool.shutdown()
+
+    def _exit(self, reload=False):
+        """
+        Protected convenience method for subclasses to force an exit. Not
+        really thread-safe, which is why it isn't public.
+        """
+        if self._keepGoing:
+            self._keepGoing = False
+            self._hupReceived = reload
+
+    # Signal handlers
+
+    def _hupHandler(self, signum, frame):
+        self._hupReceived = True
+        self._keepGoing = False
+
+    def _intHandler(self, signum, frame):
+        self._keepGoing = False
+
+    def _installSignalHandlers(self):
+        supportedSignals = [signal.SIGINT, signal.SIGTERM]
+        if hasattr(signal, 'SIGHUP'):
+            supportedSignals.append(signal.SIGHUP)
+
+        self._oldSIGs = [(x, signal.getsignal(x)) for x in supportedSignals]
+
+        for sig in supportedSignals:
+            if hasattr(signal, 'SIGHUP') and sig == signal.SIGHUP:
+                signal.signal(sig, self._hupHandler)
+            else:
+                signal.signal(sig, self._intHandler)
+
+    def _restoreSignalHandlers(self):
+        for signum, handler in self._oldSIGs:
+            signal.signal(signum, handler)
 
     def handler(self, req):
         """Special handler for WSGI."""
@@ -911,139 +1072,24 @@ class BaseFCGIServer(object):
             b'<h1>Unhandled Exception</h1>\r\n'
             b'An unhandled exception was thrown by the application.\r\n')
 
-
-class ThreadPool(object):
-    """
-    Thread pool that maintains the number of idle threads between
-    minSpare and maxSpare inclusive. By default, there is no limit on
-    the number of threads that can be started, but this can be controlled
-    by maxThreads.
-    """
-    def __init__(self, minSpare=1, maxSpare=5, maxThreads=sys.maxsize):
-        self._minSpare = minSpare
-        self._maxSpare = maxSpare
-        self._maxThreads = max(minSpare, maxThreads)
-
-        self._lock = threading.Condition()
-        self._workQueue = []
-        self._idleCount = self._workerCount = maxSpare
-
-        self._threads = []
-        self._stop = False
-
-        # Start the minimum number of worker threads.
-        for i in range(maxSpare):
-            self._start_new_thread()
-
-    def _start_new_thread(self):
-        t = threading.Thread(target=self._worker)
-        self._threads.append(t)
-        t.setDaemon(True)
-        t.start()
-        return t
-
-    def shutdown(self):
-        """shutdown all workers."""
-        self._lock.acquire()
-        self._stop = True
-        self._lock.notifyAll()
-        self._lock.release()
-
-        # wait for all threads to finish
-        for t in self._threads[:]:
-            t.join()
-
-    def addJob(self, job, allowQueuing=True):
+    def run(self):
         """
-        Adds a job to the work queue. The job object should have a run()
-        method. If allowQueuing is True (the default), the job will be
-        added to the work queue regardless if there are any idle threads
-        ready. (The only way for there to be no idle threads is if maxThreads
-        is some reasonable, finite limit.)
-
-        Otherwise, if allowQueuing is False, and there are no more idle
-        threads, the job will not be queued.
-
-        Returns True if the job was queued, False otherwise.
+        The main loop. Exits on SIGHUP, SIGINT, SIGTERM. Returns True if
+        SIGHUP was received, False otherwise.
         """
-        self._lock.acquire()
+        self._web_server_addrs = os.environ.get('FCGI_WEB_SERVER_ADDRS')
+        if self._web_server_addrs is not None:
+            self._web_server_addrs = [
+                x.strip() for x in self._web_server_addrs.split(',')]
+
+        sock = socket.fromfd(
+            FCGI_LISTENSOCK_FILENO, socket.AF_INET, socket.SOCK_STREAM)
         try:
-            # Maintain minimum number of spares.
-            while (self._idleCount < self._minSpare and
-                   self._workerCount < self._maxThreads):
-                try:
-                    self._start_new_thread()
-                except:
-                    return False
-                self._workerCount += 1
-                self._idleCount += 1
+            sock.getpeername()
+        except socket.error as e:
+            if e.args[0] != errno.ENOTCONN:
+                raise
 
-            # Hand off the job.
-            if self._idleCount or allowQueuing:
-                self._workQueue.append(job)
-                self._lock.notify()
-                return True
-            else:
-                return False
-        finally:
-            self._lock.release()
-
-    def _worker(self):
-        """
-        Worker thread routine. Waits for a job, executes it, repeat.
-        """
-        self._lock.acquire()
-        try:
-            while True:
-                while not self._workQueue and not self._stop:
-                    self._lock.wait()
-
-                if self._stop:
-                    return
-
-                # We have a job to do...
-                job = self._workQueue.pop(0)
-
-                assert self._idleCount > 0
-                self._idleCount -= 1
-
-                self._lock.release()
-
-                try:
-                    job.run()
-                except:
-                    # FIXME: This should really be reported somewhere.
-                    # But we can't simply report it to stderr because of fcgi
-                    pass
-
-                self._lock.acquire()
-
-                if self._idleCount == self._maxSpare:
-                    break  # NB: lock still held
-                self._idleCount += 1
-                assert self._idleCount <= self._maxSpare
-
-            # Die off...
-            assert self._workerCount > self._maxSpare
-            self._threads.remove(threading.currentThread())
-            self._workerCount -= 1
-        finally:
-            self._lock.release()
-
-
-class ThreadedServer(object):
-    def __init__(self, jobClass=None, jobArgs=()):
-        self._jobClass = jobClass
-        self._jobArgs = jobArgs
-
-        self._threadPool = ThreadPool()
-
-    def run(self, sock, timeout=1.0):
-        """
-        The main loop. Pass a socket that is ready to accept() client
-        connections. Return value will be True or False indiciating whether
-        or not the loop was exited due to SIGHUP.
-        """
         # Set up signal handlers.
         self._keepGoing = True
         self._hupReceived = False
@@ -1058,7 +1104,7 @@ class ThreadedServer(object):
         # Main loop.
         while self._keepGoing:
             try:
-                r, w, e = select.select([sock], [], [], timeout)
+                r, w, e = select.select([sock], [], [], 1.0)
             except select.error as e:
                 if e.args[0] == errno.EINTR:
                     continue
@@ -1075,7 +1121,7 @@ class ThreadedServer(object):
                 fcntl.fcntl(
                     clientSock.fileno(), fcntl.F_SETFD, fcntl.FD_CLOEXEC)
 
-                if not self._isClientAllowed(addr):
+                if not self._is_client_allowed(addr):
                     clientSock.close()
                     continue
 
@@ -1088,100 +1134,10 @@ class ThreadedServer(object):
                     # files.
                     clientSock.close()
 
-            self._mainloopPeriodic()
-
         self._restoreSignalHandlers()
 
         # Return bool based on whether or not SIGHUP was received.
-        return self._hupReceived
-
-    def shutdown(self):
-        """Wait for running threads to finish."""
-        self._threadPool.shutdown()
-
-    def _mainloopPeriodic(self):
-        """
-        Called with just about each iteration of the main loop. Meant to
-        be overridden.
-        """
-        pass
-
-    def _exit(self, reload=False):
-        """
-        Protected convenience method for subclasses to force an exit. Not
-        really thread-safe, which is why it isn't public.
-        """
-        if self._keepGoing:
-            self._keepGoing = False
-            self._hupReceived = reload
-
-    def _isClientAllowed(self, addr):
-        """Override to provide access control."""
-        return True
-
-    # Signal handlers
-
-    def _hupHandler(self, signum, frame):
-        self._hupReceived = True
-        self._keepGoing = False
-
-    def _intHandler(self, signum, frame):
-        self._keepGoing = False
-
-    def _installSignalHandlers(self):
-        supportedSignals = [signal.SIGINT, signal.SIGTERM]
-        if hasattr(signal, 'SIGHUP'):
-            supportedSignals.append(signal.SIGHUP)
-
-        self._oldSIGs = [(x, signal.getsignal(x)) for x in supportedSignals]
-
-        for sig in supportedSignals:
-            if hasattr(signal, 'SIGHUP') and sig == signal.SIGHUP:
-                signal.signal(sig, self._hupHandler)
-            else:
-                signal.signal(sig, self._intHandler)
-
-    def _restoreSignalHandlers(self):
-        for signum, handler in self._oldSIGs:
-            signal.signal(signum, handler)
-
-
-class WSGIServer(BaseFCGIServer, ThreadedServer):
-    """
-    FastCGI server that supports the Web Server Gateway Interface. See
-    <http://www.python.org/peps/pep-0333.html>.
-    """
-    def __init__(self, application, environ=None, roles=(FCGI_RESPONDER,)):
-        """
-        environ, if present, must be a dictionary-like object. Its
-        contents will be copied into application's environ. Useful
-        for passing application-specific variables.
-        """
-        BaseFCGIServer.__init__(
-            self, application, environ=environ, roles=roles)
-        ThreadedServer.__init__(
-            self, jobClass=self._connectionClass, jobArgs=(self, None))
-
-    def _isClientAllowed(self, addr):
-        return (
-            self._web_server_addrs is None or
-            (len(addr) == 2 and addr[0] in self._web_server_addrs))
-
-    def run(self):
-        """
-        The main loop. Exits on SIGHUP, SIGINT, SIGTERM. Returns True if
-        SIGHUP was received, False otherwise.
-        """
-        self._web_server_addrs = os.environ.get('FCGI_WEB_SERVER_ADDRS')
-        if self._web_server_addrs is not None:
-            self._web_server_addrs = [
-                x.strip() for x in self._web_server_addrs.split(',')]
-
-        sock = self._setupSocket()
-
-        ret = ThreadedServer.run(self, sock)
-
-        self._cleanupSocket(sock)
+        sock.close()
         self.shutdown()
 
-        return ret
+        return self._hupReceived
