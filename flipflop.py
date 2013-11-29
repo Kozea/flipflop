@@ -54,6 +54,7 @@ import struct
 import errno
 import threading
 import fcntl
+import resource
 import traceback
 
 # Constants from the spec.
@@ -107,11 +108,13 @@ class InputStream(object):
     File-like object representing FastCGI input streams (FCGI_STDIN and
     FCGI_DATA). Supports the minimum methods required by WSGI spec.
     """
+    # Limit the size of the InputStream's string buffer to this size + the
+    # server's maximum Record size. Since the InputStream is not seekable,
+    # we throw away already-read data once this certain amount has been read.
+    threshold = 102400 - 8192
+
     def __init__(self, conn):
         self._conn = conn
-
-        # See Server.
-        self._shrinkThreshold = conn.server.inputStreamShrinkThreshold
 
         self._buf = b''
         self._bufList = []
@@ -122,7 +125,7 @@ class InputStream(object):
 
     def _shrinkBuffer(self):
         """Gets rid of already read data (since we can't rewind)."""
-        if self._pos >= self._shrinkThreshold:
+        if self._pos >= self.threshold:
             self._buf = self._buf[self._pos:]
             self._avail -= self._pos
             self._pos = 0
@@ -436,10 +439,6 @@ class Record(object):
             self._sendall(sock, b'\x00' * self.paddingLength)
 
 
-class TimeoutException(Exception):
-    pass
-
-
 class Request(object):
     """
     Represents a single FastCGI request.
@@ -449,31 +448,18 @@ class Request(object):
     be called by your handler. However, server, params, stdin, stdout,
     stderr, and data are free for your handler's use.
     """
-    def __init__(self, conn, inputStreamClass, timeout):
+    def __init__(self, conn):
         self._conn = conn
-        self._timeout = timeout
 
         self.server = conn.server
         self.params = {}
-        self.stdin = inputStreamClass(conn)
+        self.stdin = InputStream(conn)
         self.stdout = OutputStream(conn, self, FCGI_STDOUT)
         self.stderr = OutputStream(conn, self, FCGI_STDERR, buffered=True)
-        self.data = inputStreamClass(conn)
-
-    def timeout_handler(self, signum, frame):
-        self.stderr.write('Timeout Exceeded\n')
-        self.stderr.write("\n".join(traceback.format_stack(frame)))
-        self.stderr.flush()
-
-        raise TimeoutException
+        self.data = InputStream(conn)
 
     def run(self):
         """Runs the handler, flushes the streams, and ends the request."""
-        # If there is a timeout
-        if self._timeout:
-            old_alarm = signal.signal(signal.SIGALRM, self.timeout_handler)
-            signal.alarm(self._timeout)
-
         try:
             protocolStatus, appStatus = self.server.handler(self)
         except:
@@ -483,11 +469,6 @@ class Request(object):
                 self.server.error(self)
 
             protocolStatus, appStatus = FCGI_REQUEST_COMPLETE, 0
-
-        # Restore old handler if timeout was given
-        if self._timeout:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, old_alarm)
 
         try:
             self._flush()
@@ -512,13 +493,10 @@ class Connection(object):
     connected to the web server) and is responsible for handling all
     the FastCGI message processing for that socket.
     """
-    _inputStreamClass = InputStream
-
-    def __init__(self, sock, addr, server, timeout):
+    def __init__(self, sock, addr, server):
         self._sock = sock
         self._addr = addr
         self.server = server
-        self._timeout = timeout
 
         # Active Requests for this Connection, mapped by request ID.
         self._requests = {}
@@ -639,8 +617,7 @@ class Connection(object):
         """Handle an FCGI_BEGIN_REQUEST from the web server."""
         role, flags = struct.unpack(FCGI_BeginRequestBody, inrec.contentData)
 
-        req = self.server.request_class(
-            self, self._inputStreamClass, self._timeout)
+        req = Request(self)
 
         req.requestId, req.role, req.flags = inrec.requestId, role, flags
         req.aborted = False
@@ -825,52 +802,20 @@ class WSGIServer(object):
     FastCGI server that supports the Web Server Gateway Interface. See
     <http://www.python.org/peps/pep-0333.html>.
     """
-    request_class = Request
-
     # The maximum number of bytes (per Record) to write to the server.
     # I've noticed mod_fastcgi has a relatively small receive buffer (8K or
     # so).
     maxwrite = 8192
 
-    # Limits the size of the InputStream's string buffer to this size + the
-    # server's maximum Record size. Since the InputStream is not seekable,
-    # we throw away already-read data once this certain amount has been read.
-    inputStreamShrinkThreshold = 102400 - 8192
-
-    def __init__(self, application, environ=None, roles=(FCGI_RESPONDER,)):
-        """
-        environ, if present, must be a dictionary-like object. Its
-        contents will be copied into application's environ. Useful
-        for passing application-specific variables.
-        """
-        if environ is None:
-            environ = {}
-
+    def __init__(self, application):
         self.application = application
-        self.environ = environ
-        self.roles = roles
-
-        try:
-            import resource
-            # Attempt to glean the maximum number of connections
-            # from the OS.
-            maxConns = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
-        except ImportError:
-            maxConns = 100  # Just some made up number.
-        maxReqs = maxConns
-        self._connectionClass = Connection
+        self.environ = {}
+        max_connections = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
         self.capability = {
-            FCGI_MAX_CONNS: maxConns,
-            FCGI_MAX_REQS: maxReqs,
+            FCGI_MAX_CONNS: max_connections,
+            FCGI_MAX_REQS: max_connections,
             FCGI_MPXS_CONNS: 0}
-        self._jobClass = self._connectionClass
-        self._jobArgs = (self, None)
         self._threadPool = ThreadPool()
-
-    def _is_client_allowed(self, addr):
-        return (
-            self._web_server_addrs is None or
-            (len(addr) == 2 and addr[0] in self._web_server_addrs))
 
     def shutdown(self):
         """Wait for running threads to finish."""
@@ -913,7 +858,7 @@ class WSGIServer(object):
 
     def handler(self, req):
         """Special handler for WSGI."""
-        if req.role not in self.roles:
+        if req.role != FCGI_RESPONDER:
             return FCGI_UNKNOWN_ROLE, 0
 
         # Mostly taken from example CGI gateway.
@@ -1121,12 +1066,13 @@ class WSGIServer(object):
                 fcntl.fcntl(
                     clientSock.fileno(), fcntl.F_SETFD, fcntl.FD_CLOEXEC)
 
-                if not self._is_client_allowed(addr):
+                if not (self._web_server_addrs is None or
+                        (len(addr) == 2 and addr[0] in self._web_server_addrs)):
                     clientSock.close()
                     continue
 
                 # Hand off to Connection.
-                conn = self._jobClass(clientSock, addr, *self._jobArgs)
+                conn = Connection(clientSock, addr, self)
                 if not self._threadPool.addJob(conn, allowQueuing=False):
                     # No thread left, immediately close the socket to hopefully
                     # indicate to the web server that we're at our limit...
