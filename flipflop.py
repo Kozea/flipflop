@@ -32,7 +32,7 @@ flipflop - a FastCGI/WSGI gateway.
 For more information about FastCGI, see <http://www.fastcgi.com/>.
 
 For more information about the Web Server Gateway Interface, see
-<http://www.python.org/peps/pep-0333.html>.
+<http://www.python.org/peps/pep-3333.html>.
 
 Example usage::
 
