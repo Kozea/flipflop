@@ -7,7 +7,6 @@ setup(
     version='1.0',
     py_modules=['flipflop'],
     packages=['flipflop'],
-    zip_safe=True,
     author='Guillaume Ayoub',
     author_email='guillaume.ayoub@kozea.fr',
     description='FastCGI wrapper for WSGI applications',
