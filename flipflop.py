@@ -845,7 +845,7 @@ class WSGIServer(object):
             if isinstance(status, str):
                 status = status.encode('latin-1')
 
-            assert type(status) is bytes, 'Status must be a string'
+            assert type(status) is bytes, 'Status must be bytes'
             assert len(status) >= 4, 'Status must be at least 4 characters'
             assert int(status[:3]), 'Status must begin with 3-digit code'
             assert status[3] == 0x20, 'Status must have a space after code'
